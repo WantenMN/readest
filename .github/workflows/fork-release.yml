@@ -1,0 +1,283 @@
+# Fork release builds.
+#
+# Triggered by pushing a tag (the tag must point at a commit that contains this
+# workflow, i.e. the HEAD of the fork release branch):
+#   git tag v<version>            # e.g. v0.2.1-fork
+#   git push wanten v<version>
+#
+# Builds exactly three artifacts and, only after ALL legs succeed, publishes
+# them to a GitHub release on the tag (no partial releases):
+#   Readest_<version>_arm64.apk     (Android arm64)
+#   Readest_<version>_x64-setup.exe (Windows x86_64 NSIS installer)
+#   Readest_<version>_amd64.deb     (Linux amd64)
+# <version> is the tag with the leading 'v' stripped (SemVer-normalized).
+#
+# Deliberately secret-free: unlike release.yml it needs no TAURI signing key
+# (desktop builds disable updater artifacts via --config) and no Android
+# keystore secret. The Android APK is signed with the committed fixed key
+# (apps/readest-app/src-tauri/android-fork.keystore.p12), so the signature is
+# stable across builds and install-over-update works. If
+# ANDROID_KEY_ALIAS/ANDROID_KEY_PASSWORD/ANDROID_KEY_BASE64 are added to the
+# fork's repo secrets, the release APK is signed with those instead.
+
+name: Fork Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-latest
+            release: android
+            rust_target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          - os: windows-latest
+            release: windows
+            rust_target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            release: linux
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.config.os }}
+    # Android alone runs ~50min on a cold cache; 90 keeps headroom for setup.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java (for Android build only)
+        if: matrix.config.release == 'android'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK (for Android build only)
+        if: matrix.config.release == 'android'
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: install NDK (for Android build only)
+        if: matrix.config.release == 'android'
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.config.rust_target }}
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          key: fork-${{ matrix.config.os }}-${{ matrix.config.release }}-cargo
+
+      # The 3 legs each run `pnpm build` (Next.js export) on a fresh runner;
+      # sharing .next/cache across legs and runs cuts the frontend build way
+      # down. Keyed on src so code changes bust it, with a prefix fallback so an
+      # unchanged branch reuses the last build's cache even across version tags.
+      - name: cache Next.js build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/readest-app/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('apps/readest-app/src/**/*.{ts,tsx,css,json}', 'apps/readest-app/next.config.mjs') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-
+
+      # Gradle dependency + build cache (Android leg): avoids re-downloading the
+      # Gradle distribution and dependencies on every run.
+      - name: cache Gradle
+        if: matrix.config.release == 'android'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/readest-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: install dependencies (ubuntu only)
+        if: contains(matrix.config.os, 'ubuntu') && matrix.config.release != 'android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: create .env.local file for Next.js
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > apps/readest-app/.env.local
+
+      - name: compute version from tag
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          # SemVer forbids leading zeros in numeric identifiers (2026.08.15 is
+          # invalid, 2026.8.15 is not), so normalize before stamping.
+          version="$(node -e "const v='${version}'.split('.').map(p=>/^0[0-9]+$/.test(p)?String(+p):p).join('.');process.stdout.write(v)")"
+          echo "fork_tag=$tag" >> "$GITHUB_ENV"
+          echo "fork_version=$version" >> "$GITHUB_ENV"
+
+      # Desktop legs stamp the version from the tag BEFORE `tauri build` so the
+      # bundle filenames carry it. The Android leg stamps AFTER
+      # `tauri android init` + `git checkout .` (init rewrites package.json).
+      - name: stamp package version (desktop only)
+        if: matrix.config.release != 'android'
+        shell: bash
+        run: |
+          node -e "const f='apps/readest-app/package.json';const j=require('./'+f);j.version='${fork_version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+      - name: build Android arm64 APK
+        if: matrix.config.release == 'android'
+        shell: bash
+        timeout-minutes: 75
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+          # Patch the version AFTER checkout so the stamp survives init.
+          node -e "const f='package.json';const j=require('./'+f);j.version='${fork_version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            pushd src-tauri/gen/android
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+            echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+            base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+            popd
+          else
+            # No keystore secret: sign with the committed fixed fork keystore so
+            # the signature is stable across builds (install-over-update works).
+            # storeFile resolves against the app module dir
+            # (gen/android/app) -> src-tauri/android-fork.keystore.p12.
+            pushd src-tauri/gen/android
+            echo "keyAlias=readest" > keystore.properties
+            echo "password=readest-fork-2026" >> keystore.properties
+            echo "storeFile=../../../android-fork.keystore.p12" >> keystore.properties
+            popd
+          fi
+
+          pnpm tauri android build -t aarch64
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "Readest_${fork_version}_arm64.apk"
+
+      - name: upload Android APK
+        if: matrix.config.release == 'android'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readest-apk
+          path: apps/readest-app/Readest_${{ env.fork_version }}_arm64.apk
+          if-no-files-found: error
+
+      - name: build Windows x64 NSIS installer
+        if: matrix.config.release == 'windows'
+        shell: bash
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          cd ../..
+          # Cargo workspace: bundles land in the REPO-ROOT target/ dir.
+
+      - name: upload Windows installer
+        if: matrix.config.release == 'windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readest-windows
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_${{ env.fork_version }}_x64-setup.exe
+          if-no-files-found: error
+
+      - name: build Linux amd64 deb
+        if: matrix.config.release == 'linux'
+        shell: bash
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          cd ../..
+
+      - name: upload Linux deb
+        if: matrix.config.release == 'linux'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: readest-linux
+          path: target/release/bundle/deb/Readest_${{ env.fork_version }}_amd64.deb
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      # gh needs a git checkout to resolve the target repository.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: readest-*
+          merge-multiple: true
+
+      - name: create release and upload artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+            if [ "$is_draft" = "true" ]; then
+              # Deleting + re-pushing a tag turns its release into a draft;
+              # publish it instead of skipping.
+              echo "::notice::release $tag exists as a draft — publishing"
+              gh release edit "$tag" --draft=false
+            else
+              echo "::notice::release $tag already exists — skipping creation"
+            fi
+          else
+            gh release create "$tag" --title "$tag" --notes "Readest fork build for $tag"
+          fi
+          ls -la artifacts
+          gh release upload "$tag" artifacts/* --clobber
