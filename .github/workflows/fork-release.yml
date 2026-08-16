@@ -14,10 +14,11 @@
 #
 # Deliberately secret-free: unlike release.yml it needs no TAURI signing key
 # (desktop builds disable updater artifacts via --config) and no Android
-# keystore. Without the ANDROID_KEY_BASE64 secret the arm64 APK is signed with
-# the Android debug keystore (see the sed in the android step) so it stays
-# installable. If ANDROID_KEY_ALIAS/ANDROID_KEY_PASSWORD/ANDROID_KEY_BASE64 are
-# added to the fork's repo secrets, the release APK is signed with them instead.
+# keystore secret. The Android APK is signed with the committed fixed key
+# (apps/readest-app/src-tauri/android-fork.keystore.p12), so the signature is
+# stable across builds and install-over-update works. If
+# ANDROID_KEY_ALIAS/ANDROID_KEY_PASSWORD/ANDROID_KEY_BASE64 are added to the
+# fork's repo secrets, the release APK is signed with those instead.
 
 name: Fork Release
 
@@ -183,9 +184,14 @@ jobs:
             echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
             popd
           else
-            # No keystore secret in this fork: sign the release build with the
-            # Android debug keystore so the APK stays installable.
-            sed -i '/^        getByName("release") {/a\            signingConfig = signingConfigs.getByName("debug")' src-tauri/gen/android/app/build.gradle.kts
+            # No keystore secret: sign with the committed fixed fork keystore so
+            # the signature is stable across builds (install-over-update works).
+            # Relative to src-tauri/gen/android/ -> src-tauri/android-fork.keystore.p12
+            pushd src-tauri/gen/android
+            echo "keyAlias=readest" > keystore.properties
+            echo "password=readest-fork-2026" >> keystore.properties
+            echo "storeFile=../../android-fork.keystore.p12" >> keystore.properties
+            popd
           fi
 
           pnpm tauri android build -t aarch64
