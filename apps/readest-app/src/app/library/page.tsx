@@ -21,7 +21,7 @@ import { createThrottledCheckpoint } from '@/utils/checkpoint';
 import { DEFAULT_NEARBY_WORDS } from '@/utils/searchConfig';
 import { clearLibrarySearchHistory, loadLibrarySearchHistory } from './utils/searchHistory';
 import type { LibrarySearchTarget } from '@/types/book';
-import { navigateToLibrary, navigateToLogin, navigateToReader } from '@/utils/nav';
+import { navigateToLibrary, navigateToReader } from '@/utils/nav';
 import { getBookWithUpdatedMetadata, listFormater } from '@/utils/book';
 import { getImportErrorMessage } from '@/services/errors';
 import { ingestFile } from '@/services/ingestService';
@@ -384,18 +384,12 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
   usePullToRefresh(
     scrollRef,
     async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
+      // No login gate: the file-sync pass works logged out; pullLibrary only
+      // runs the native Readest Cloud pass when a user is signed in.
       await pullLibrary(false, true);
       checkOPDSSubscriptions(true);
     },
     async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
       await pullLibrary(true, true);
       checkOPDSSubscriptions(true);
     },
