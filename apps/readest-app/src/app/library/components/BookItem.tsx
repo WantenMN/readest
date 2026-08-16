@@ -10,13 +10,10 @@ import {
 
 import { Book } from '@/types/book';
 import { useEnv } from '@/context/EnvContext';
-import { useAuth } from '@/context/AuthContext';
-import { useRouter } from 'next/navigation';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
 import { LibraryCoverFitType, LibraryViewModeType } from '@/types/settings';
-import { navigateToLogin } from '@/utils/nav';
 import { isReadestCloudStorageActive } from '@/services/sync/cloudSyncProvider';
 import { isFeedBook } from '@/services/rss/feedBookUrl';
 import { isAudiobook } from '@/utils/audiobook';
@@ -55,8 +52,6 @@ const BookItem: React.FC<BookItemProps> = ({
   showTimeRemaining,
 }) => {
   const _ = useTranslation();
-  const router = useRouter();
-  const { user } = useAuth();
   const { appService } = useEnv();
   const { settings } = useSettingsStore();
   const showSpine = skeuomorphicCovers ?? settings.librarySkeuomorphicCovers;
@@ -310,10 +305,6 @@ const BookItem: React.FC<BookItemProps> = ({
                     className='show-cloud-button -m-2 p-2'
                     onPointerDown={(e) => e.stopPropagation()}
                     onClick={() => {
-                      if (!user) {
-                        navigateToLogin(router);
-                        return;
-                      }
                       if (!book.uploadedAt) {
                         handleBookUpload(book);
                       } else if (!book.downloadedAt) {
