@@ -98,6 +98,31 @@ jobs:
         with:
           key: fork-${{ matrix.config.os }}-${{ matrix.config.release }}-cargo
 
+      # The 3 legs each run `pnpm build` (Next.js export) on a fresh runner;
+      # sharing .next/cache across legs and runs cuts the frontend build way
+      # down. Keyed on src so code changes bust it, with a prefix fallback so an
+      # unchanged branch reuses the last build's cache even across version tags.
+      - name: cache Next.js build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/readest-app/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('apps/readest-app/src/**/*.{ts,tsx,css,json}', 'apps/readest-app/next.config.mjs') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-
+
+      # Gradle dependency + build cache (Android leg): avoids re-downloading the
+      # Gradle distribution and dependencies on every run.
+      - name: cache Gradle
+        if: matrix.config.release == 'android'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/readest-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
       - name: install dependencies (ubuntu only)
         if: contains(matrix.config.os, 'ubuntu') && matrix.config.release != 'android'
         run: |
