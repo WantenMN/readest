@@ -156,11 +156,12 @@ jobs:
           else
             # No keystore secret: sign with the committed fixed fork keystore so
             # the signature is stable across builds (install-over-update works).
-            # Relative to src-tauri/gen/android/ -> src-tauri/android-fork.keystore.p12
+            # storeFile resolves against the app module dir
+            # (gen/android/app) -> src-tauri/android-fork.keystore.p12.
             pushd src-tauri/gen/android
             echo "keyAlias=readest" > keystore.properties
             echo "password=readest-fork-2026" >> keystore.properties
-            echo "storeFile=../../android-fork.keystore.p12" >> keystore.properties
+            echo "storeFile=../../../android-fork.keystore.p12" >> keystore.properties
             popd
           fi
 
