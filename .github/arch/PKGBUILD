@@ -1,0 +1,25 @@
+# Fork build: pkgver is stamped by fork-release.yml before makepkg runs.
+# The payload (binary, resources, icons, .desktop) is extracted from Tauri's
+# .deb into ./stage by CI, packed into stage.tar.zst (makepkg sources must be
+# files or URLs, not directories) and installed verbatim.
+
+pkgname=readest
+pkgver=__PKGVER__
+pkgrel=1
+pkgdesc="Readest is a modern ebook reader for EPUB, MOBI, AZW, PDF, TXT and more"
+arch=('x86_64')
+url="https://readest.com"
+license=('AGPL-3.0-only')
+depends=(
+  'webkit2gtk-4.1'
+  'gtk3'
+  'librsvg'
+  'libayatana-appindicator-gtk3'
+  'glib-networking'
+)
+source=('stage.tar.gz')
+sha256sums=('SKIP')
+
+package() {
+  cp -a "$srcdir/stage/." "$pkgdir/"
+}

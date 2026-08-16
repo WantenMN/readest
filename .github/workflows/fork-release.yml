@@ -9,7 +9,12 @@
 # them to a GitHub release on the tag (no partial releases):
 #   Readest_<version>_arm64.apk     (Android arm64)
 #   Readest_<version>_x64-setup.exe (Windows x86_64 NSIS installer)
-#   Readest_<version>_amd64.deb     (Linux amd64)
+#   readest-<pkgver>-1-x86_64.pkg.tar.zst (Linux x86_64 Arch package)
+#
+# The Linux leg builds the .deb (Tauri's only Linux bundle) purely as payload
+# source: its contents (binary, resources, icons, .desktop entry) are
+# extracted and repacked as an Arch package with makepkg in an
+# archlinux:base-devel container. The PKGBUILD lives in .github/arch/.
 # <version> is the tag with the leading 'v' stripped (SemVer-normalized).
 #
 # Deliberately secret-free: unlike release.yml it needs no TAURI signing key
@@ -36,6 +41,7 @@ concurrency:
 
 jobs:
   build:
+    name: build-${{ matrix.config.release }}
     strategy:
       fail-fast: false
       matrix:
@@ -223,7 +229,7 @@ jobs:
           path: target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_${{ env.fork_version }}_x64-setup.exe
           if-no-files-found: error
 
-      - name: build Linux amd64 deb
+      - name: build Linux x86_64 Arch package
         if: matrix.config.release == 'linux'
         shell: bash
         timeout-minutes: 45
@@ -235,13 +241,38 @@ jobs:
           pnpm tauri build --bundles deb \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
           cd ../..
+          # Tauri has no native Arch output; the .deb payload (binary,
+          # resources, icons, .desktop) is extracted and repacked with
+          # makepkg (see .github/arch/PKGBUILD).
+          rm -rf archpkg/stage
+          mkdir -p archpkg/stage
+          dpkg-deb -x "target/release/bundle/deb/Readest_${fork_version}_amd64.deb" archpkg/stage
+          # makepkg sources must be files/URLs, not directories; the staged
+          # payload is tarballed with a top-level stage/ dir so extraction
+          # lands in $srcdir/stage (see .github/arch/PKGBUILD).
+          tar -czf archpkg/stage.tar.gz -C archpkg stage
+          archver="${fork_version//-/.}"
+          sed -i "s/^pkgver=.*/pkgver=${archver}/" .github/arch/PKGBUILD
+          cp .github/arch/PKGBUILD archpkg/
+          # makepkg refuses to run as root, hence the builder user.
+          docker run --rm \
+            -v "$PWD/archpkg:/build" \
+            archlinux/archlinux:base-devel \
+            bash -c '
+              set -euo pipefail
+              pacman -Syu --noconfirm
+              useradd -m builder
+              chown -R builder:builder /build
+              cd /build
+              su builder -c "makepkg -f --noconfirm --nodeps"
+            '
 
-      - name: upload Linux deb
+      - name: upload Linux Arch package
         if: matrix.config.release == 'linux'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: readest-linux
-          path: target/release/bundle/deb/Readest_${{ env.fork_version }}_amd64.deb
+          name: readest-archlinux
+          path: archpkg/*.pkg.tar.zst
           if-no-files-found: error
 
   publish:
