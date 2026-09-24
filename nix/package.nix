@@ -165,8 +165,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
       --replace-fail '"productName": "Readest"' '"productName": "readest"'
     jq 'del(.plugins."deep-link")' src-tauri/tauri.conf.json | sponge src-tauri/tauri.conf.json
     substituteInPlace src/services/constants.ts \
-      --replace-fail "autoCheckUpdates: true" "autoCheckUpdates: false" \
-      --replace-fail "telemetryEnabled: true" "telemetryEnabled: false"
+      --replace-fail "autoCheckUpdates: true" "autoCheckUpdates: false"
 
     jq '.version = "${finalAttrs.version}"' package.json | sponge package.json
 
