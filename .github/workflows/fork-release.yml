@@ -13,6 +13,7 @@
 #   Readest_<version>_x64-setup.exe (Windows x86_64 NSIS installer)
 #   readest-<pkgver>-1-x86_64.pkg.tar.zst (Linux x86_64 Arch package)
 #   Readest_<version>_amd64.deb (Linux x86_64 Debian package)
+#   readest-<version>-nix-x86_64-linux.tar.zst (Nix store closure for NixOS; see fork-release-nix.yml)
 #
 # The Linux leg builds the .deb (Tauri's only Linux bundle), publishes it
 # directly, and also extracts its contents (binary, resources, icons,

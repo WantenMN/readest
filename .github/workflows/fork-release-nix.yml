@@ -1,0 +1,58 @@
+name: Fork Release Nix
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-nix:
+    name: build-nix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+
+      - name: compute version from tag
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          # Same SemVer normalization as the main fork-release workflow.
+          version="$(node -e "const v='${version}'.split('.').map(p=>/^0[0-9]+$/.test(p)?String(+p):p).join('.');process.stdout.write(v)")"
+          echo "fork_tag=$tag" >> "$GITHUB_ENV"
+          echo "fork_version=$version" >> "$GITHUB_ENV"
+
+      - name: build the nix package
+        run: nix build .#default -L
+
+      - name: export the nix store closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          store_path="$(readlink -f result)"
+          nix-store --export "$store_path" | zstd -T0 -3 -o "readest-${fork_version}-nix-x86_64-linux.tar.zst"
+          ls -lh "readest-${fork_version}-nix-x86_64-linux.tar.zst"
+
+      - name: publish to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::release $tag exists"
+          else
+            gh release create "$tag" --title "$tag" --notes "Readest fork build for $tag" || true
+          fi
+          gh release upload "$tag" "readest-${fork_version}-nix-x86_64-linux.tar.zst" --clobber
