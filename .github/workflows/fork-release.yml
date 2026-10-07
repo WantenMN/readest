@@ -12,10 +12,11 @@
 #   Readest_<version>_arm64.apk     (Android arm64)
 #   Readest_<version>_x64-setup.exe (Windows x86_64 NSIS installer)
 #   readest-<pkgver>-1-x86_64.pkg.tar.zst (Linux x86_64 Arch package)
+#   Readest_<version>_amd64.deb (Linux x86_64 Debian package)
 #
-# The Linux leg builds the .deb (Tauri's only Linux bundle) purely as payload
-# source: its contents (binary, resources, icons, .desktop entry) are
-# extracted and repacked as an Arch package with makepkg in an
+# The Linux leg builds the .deb (Tauri's only Linux bundle), publishes it
+# directly, and also extracts its contents (binary, resources, icons,
+# .desktop entry) to repack as an Arch package with makepkg in an
 # archlinux:base-devel container. The PKGBUILD lives in .github/arch/.
 # <version> is the tag with the leading 'v' stripped (SemVer-normalized).
 #
@@ -289,3 +290,6 @@ jobs:
           esac
           # shellcheck disable=SC2086: intentional glob expansion for linux
           gh release upload "$tag" $file --clobber
+          if [ "${{ matrix.config.release }}" = "linux" ]; then
+            gh release upload "$tag" "target/release/bundle/deb/Readest_${fork_version}_amd64.deb" --clobber
+          fi
