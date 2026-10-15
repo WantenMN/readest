@@ -15,7 +15,7 @@ name: Fork Tarball (Linux)
 on:
   push:
     branches:
-      - release/fork
+      - 'release/fork'
   workflow_dispatch:
 
 permissions:
