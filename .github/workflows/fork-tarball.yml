@@ -140,11 +140,13 @@ jobs:
 
       - name: compute rolling version
         # Commit time (not wall clock): all three legs of one push must stamp
-        # the identical version. No zero-padding (SemVer forbids leading zeros).
+        # the identical version. No zero-padding: SemVer forbids leading zeros
+        # (2026.08.15 invalid); strip them with sed because Windows git does
+        # not support the %-m strftime flag.
         shell: bash
         run: |
           short_sha=$(git rev-parse --short HEAD)
-          ver_date=$(git show -s --format=%cd --date=format:%Y.%-m.%-d HEAD)
+          ver_date=$(git show -s --format=%cd --date=format:%Y.%m.%d HEAD | sed -E 's/\.0([0-9])/.\1/g')
           ver="${ver_date}-g${short_sha}"
           echo "fork_version=${ver}" >> "$GITHUB_ENV"
           echo "TARBALL=readest-${ver}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
