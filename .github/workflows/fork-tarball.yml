@@ -1,0 +1,339 @@
+# Fork rolling builds (all platforms, traditional packaging).
+#
+# Push to release/fork -> each leg builds its artifact and publishes it to a
+# shared VERSIONED release (`fork-<version>`, one release per version, never
+# overwritten) as soon as it finishes; the release is created by whichever
+# leg gets there first and the others just upload their asset:
+#   Readest_<version>_arm64.apk          (Android arm64)
+#   Readest_<version>_x64-setup.exe      (Windows x86_64 NSIS installer)
+#   readest-<version>-linux-x86_64.tar.gz (Linux x86_64 plain tarball repacked
+#                                          from the Tauri .deb payload)
+#
+# Old versions are RETAINED as separate releases (newest 10, older pruned):
+# machines that have not updated can still reinstall the exact version they
+# pin. The linux leg additionally fills version/url/hash into
+# dist/nix/readest.nix, uploads it as a versioned asset plus the fixed-name
+# pointer on the rolling tag, and verifies with a real `nix build`.
+# dotfiles consumes the pointer via pkgs/update-fork-tarballs.sh.
+#
+# This is the ONLY release flow: every push to release/fork produces one
+# versioned release. (The old tag-triggered fork-release.yml was retired;
+# existing `v*` releases stay untouched.)
+name: Fork Tarball (rolling)
+
+on:
+  push:
+    branches:
+      - 'release/fork'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  # Fixed-name pointer consumed by dotfiles (overwritten every linux run).
+  NIX_ASSET: readest.nix
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+  KEEP_VERSIONS: "10"
+
+jobs:
+  tarball:
+    name: rolling-${{ matrix.config.release }}
+    if: github.repository == 'WantenMN/readest'
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-latest
+            release: android
+            rust_target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+          - os: windows-latest
+            release: windows
+            rust_target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            release: linux
+            rust_target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java (for Android build only)
+        if: matrix.config.release == 'android'
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK (for Android build only)
+        if: matrix.config.release == 'android'
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: 'platform-tools'
+
+      - name: install NDK (for Android build only)
+        if: matrix.config.release == 'android'
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.config.rust_target }}
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          key: fork-tarball-${{ matrix.config.release }}-cargo
+
+      - name: cache Next.js build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/readest-app/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('apps/readest-app/src/**/*.{ts,tsx,css,json}', 'apps/readest-app/next.config.mjs') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-
+
+      - name: cache Gradle (Android only)
+        if: matrix.config.release == 'android'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('apps/readest-app/src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: install dependencies (ubuntu, non-Android)
+        if: contains(matrix.config.os, 'ubuntu') && matrix.config.release != 'android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: create .env.local file for Next.js
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > apps/readest-app/.env.local
+
+      - name: compute rolling version
+        # Commit time (not wall clock): all three legs of one push must stamp
+        # the identical version. No zero-padding: SemVer forbids leading zeros
+        # (2026.08.15 invalid); strip them with sed because Windows git does
+        # not support the %-m strftime flag.
+        shell: bash
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(git show -s --format=%cd --date=format:%Y.%m.%d HEAD | sed -E 's/\.0([0-9])/.\1/g')
+          ver="${ver_date}-g${short_sha}"
+          echo "fork_version=${ver}" >> "$GITHUB_ENV"
+          echo "TARBALL=readest-${ver}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          echo "NIX_VERSIONED=readest-${ver}.nix" >> "$GITHUB_ENV"
+
+      - name: stamp package version (desktop only)
+        if: matrix.config.release != 'android'
+        shell: bash
+        run: |
+          node -e "const f='apps/readest-app/package.json';const j=require('./'+f);j.version='${fork_version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+      - name: build Android arm64 APK
+        if: matrix.config.release == 'android'
+        shell: bash
+        timeout-minutes: 75
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+          # Patch the version AFTER checkout so the stamp survives init.
+          node -e "const f='package.json';const j=require('./'+f);j.version='${fork_version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            pushd src-tauri/gen/android
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+            echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+            base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+            popd
+          else
+            pushd src-tauri/gen/android
+            echo "keyAlias=readest" > keystore.properties
+            echo "password=readest-fork-2026" >> keystore.properties
+            echo "storeFile=../../../android-fork.keystore.p12" >> keystore.properties
+            popd
+          fi
+
+          pnpm tauri android build -t aarch64
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "Readest_${fork_version}_arm64.apk"
+
+      - name: build Windows x64 NSIS installer
+        if: matrix.config.release == 'windows'
+        shell: bash
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          cd ../..
+
+      - name: build Linux x86_64 tarball payload
+        if: matrix.config.release == 'linux'
+        shell: bash
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          cd ../..
+          # Tauri has no native plain-tarball output; the .deb payload
+          # (binary, resources, icons, .desktop) is extracted and repacked
+          # as a plain tar.gz (contents of stage/usr, top level share/).
+          rm -rf tarball/stage
+          mkdir -p tarball/stage
+          dpkg-deb -x "target/release/bundle/deb/Readest_${fork_version}_amd64.deb" tarball/stage
+          tar -czf "tarball/${TARBALL}" -C tarball/stage/usr .
+          ls -lh "tarball/${TARBALL}"
+
+      - name: smoke test staged payload (linux only)
+        if: matrix.config.release == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/readest-smoke
+          mkdir -p /tmp/readest-smoke
+          tar -xzf "tarball/${TARBALL}" -C /tmp/readest-smoke
+          test -x /tmp/readest-smoke/share/Readest/readest
+          test -f /tmp/readest-smoke/share/applications/Readest.desktop
+
+      # Each leg publishes its own artifact to the shared VERSIONED release
+      # (`fork-<version>`, one release per version, never overwritten) as soon
+      # as the build finishes. Release creation is idempotent: the first leg
+      # creates it, the others just upload. Old versions are retained as
+      # separate releases so machines that have not updated can still
+      # reinstall the exact version they pin.
+      - name: publish to versioned release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver_tag="fork-${fork_version}"
+          echo "ver_tag=${ver_tag}" >> "$GITHUB_ENV"
+          git tag -f "$ver_tag"
+          git push -f origin "$ver_tag"
+          if ! gh release view "$ver_tag" >/dev/null 2>&1; then
+            gh release create "$ver_tag" \
+              --title "Readest fork ${fork_version}" \
+              --notes "Rolling prebuilt artifacts from release/fork (${GITHUB_SHA})." \
+              --target release/fork
+          fi
+          case "${{ matrix.config.release }}" in
+            android) file="apps/readest-app/Readest_${fork_version}_arm64.apk" ;;
+            windows) file="target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_${fork_version}_x64-setup.exe" ;;
+            linux)   file="tarball/${TARBALL}" ;;
+          esac
+          gh release upload "$ver_tag" "$file" --clobber
+
+      - name: Install nix (linux verification only)
+        if: matrix.config.release == 'linux'
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: generate + publish verified .nix and verify nix build (linux only)
+        if: matrix.config.release == 'linux'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/WantenMN/readest/releases/download/${ver_tag}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${fork_version}\";|" \
+            -e "s|url = \".*\";|url = \"${url}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          # Versioned asset (retained on its own release) + fixed-name pointer
+          # (rolling tag, dotfiles target).
+          cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
+          gh release upload "$ver_tag" "dist/nix/${NIX_VERSIONED}" --clobber
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Readest fork rolling pointers" \
+              --notes "Fixed-name readest.nix pointer to the newest versioned release. Each version has its own release; old versions are retained (newest 10)." \
+              --target release/fork
+          fi
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          test -x "$out/bin/readest"
+
+      - name: Prune old versioned releases (keep newest, linux leg only)
+        # Old versions are separate releases so machines that have not updated
+        # can still reinstall the exact version they pin (all three platforms
+        # travel together in one release); only releases beyond the newest
+        # $KEEP_VERSIONS are deleted (release + tag). Stable `v*` tag releases
+        # never match `fork-*` and are never touched. The rolling pointer
+        # release is never touched.
+        if: matrix.config.release == 'linux'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tags=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq -r 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E '^fork-' | grep -v -x "$ROLL_TAG" || true)
+          count=$(echo "$tags" | grep -c . || true)
+          count=${count:-0}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            echo "$tags" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "pruning old versioned release: $t"
+              gh release delete "$t" --cleanup-tag -y
+            done
+          else
+            echo "keeping all $count versioned release(s)"
+          fi
