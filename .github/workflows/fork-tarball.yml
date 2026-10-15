@@ -1,19 +1,19 @@
 # Fork rolling builds (all platforms, traditional packaging).
 #
-# Push to release/fork -> each leg builds its artifact and publishes it to
-# the rolling tag `fork-linux-x86_64` (name is historical; it now holds all
-# platforms) as soon as it finishes; the release is created by whichever leg
-# gets there first and the others just add their asset:
+# Push to release/fork -> each leg builds its artifact and publishes it to a
+# shared VERSIONED release (`fork-<version>`, one release per version, never
+# overwritten) as soon as it finishes; the release is created by whichever
+# leg gets there first and the others just upload their asset:
 #   Readest_<version>_arm64.apk          (Android arm64)
 #   Readest_<version>_x64-setup.exe      (Windows x86_64 NSIS installer)
 #   readest-<version>-linux-x86_64.tar.gz (Linux x86_64 plain tarball repacked
 #                                          from the Tauri .deb payload)
 #
-# Versioned assets ACCUMULATE (pruned to newest 10 per platform): old
-# versions stay downloadable so machines that have not updated can still
-# reinstall the exact version they pin. The linux leg additionally fills
-# version/url/hash into dist/nix/readest.nix, uploads it as both a versioned
-# asset and the fixed-name pointer, and verifies with a real `nix build`.
+# Old versions are RETAINED as separate releases (newest 10, older pruned):
+# machines that have not updated can still reinstall the exact version they
+# pin. The linux leg additionally fills version/url/hash into
+# dist/nix/readest.nix, uploads it as a versioned asset plus the fixed-name
+# pointer on the rolling tag, and verifies with a real `nix build`.
 # dotfiles consumes the pointer via pkgs/update-fork-tarballs.sh.
 #
 # Versioned tag releases stay in fork-release.yml (same three artifacts per
@@ -238,21 +238,26 @@ jobs:
           test -x /tmp/readest-smoke/share/Readest/readest
           test -f /tmp/readest-smoke/share/applications/Readest.desktop
 
-      # Each leg publishes its own artifact as soon as the build finishes.
-      # Release creation is idempotent: the first leg creates it, the others
-      # just upload; versioned names accumulate (pruned by the linux leg).
-      - name: publish to rolling release
+      # Each leg publishes its own artifact to the shared VERSIONED release
+      # (`fork-<version>`, one release per version, never overwritten) as soon
+      # as the build finishes. Release creation is idempotent: the first leg
+      # creates it, the others just upload. Old versions are retained as
+      # separate releases so machines that have not updated can still
+      # reinstall the exact version they pin.
+      - name: publish to versioned release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git tag -f "$ROLL_TAG"
-          git push -f origin "$ROLL_TAG"
-          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
-            gh release create "$ROLL_TAG" \
-              --title "Readest fork rolling (all platforms)" \
-              --notes "Rolling prebuilt artifacts from release/fork (versioned file names accumulate, pruned to newest ${KEEP_VERSIONS} per platform). Nix consumers fetch ${NIX_ASSET}." \
+          ver_tag="fork-${fork_version}"
+          echo "ver_tag=${ver_tag}" >> "$GITHUB_ENV"
+          git tag -f "$ver_tag"
+          git push -f origin "$ver_tag"
+          if ! gh release view "$ver_tag" >/dev/null 2>&1; then
+            gh release create "$ver_tag" \
+              --title "Readest fork ${fork_version}" \
+              --notes "Rolling prebuilt artifacts from release/fork (${GITHUB_SHA})." \
               --target release/fork
           fi
           case "${{ matrix.config.release }}" in
@@ -260,7 +265,7 @@ jobs:
             windows) file="target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_${fork_version}_x64-setup.exe" ;;
             linux)   file="tarball/${TARBALL}" ;;
           esac
-          gh release upload "$ROLL_TAG" "$file" --clobber
+          gh release upload "$ver_tag" "$file" --clobber
 
       - name: Install nix (linux verification only)
         if: matrix.config.release == 'linux'
@@ -273,7 +278,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          url="https://github.com/WantenMN/readest/releases/download/${ROLL_TAG}/${TARBALL}"
+          url="https://github.com/WantenMN/readest/releases/download/${ver_tag}/${TARBALL}"
           sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
           echo "sri: $sri"
           if [ -z "$sri" ] || [ "$sri" = "null" ]; then
@@ -286,59 +291,48 @@ jobs:
             -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
             "dist/nix/${NIX_ASSET}"
           grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
-          # Versioned asset (retained) + fixed-name pointer (dotfiles target).
+          # Versioned asset (retained on its own release) + fixed-name pointer
+          # (rolling tag, dotfiles target).
           cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
-          gh release upload "$ROLL_TAG" "dist/nix/${NIX_VERSIONED}" --clobber
+          gh release upload "$ver_tag" "dist/nix/${NIX_VERSIONED}" --clobber
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Readest fork rolling pointers" \
+              --notes "Fixed-name readest.nix pointer to the newest versioned release. Each version has its own release; old versions are retained (newest 10)." \
+              --target release/fork
+          fi
           gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
           out=$(nix build -L --impure --no-link --print-out-paths --expr \
             "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
           echo "built: $out"
           test -x "$out/bin/readest"
 
-      - name: Prune old versions (keep newest, linux leg only)
-        # Old versions stay available so machines that have not updated can
-        # still reinstall the exact version they pin; only versions beyond
-        # the newest $KEEP_VERSIONS per platform are deleted.
+      - name: Prune old versioned releases (keep newest, linux leg only)
+        # Old versions are separate releases so machines that have not updated
+        # can still reinstall the exact version they pin (all three platforms
+        # travel together in one release); only releases beyond the newest
+        # $KEEP_VERSIONS are deleted (release + tag). Stable `v*` tag releases
+        # never match `fork-*` and are never touched. The rolling pointer
+        # release is never touched.
         if: matrix.config.release == 'linux'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          prune_pattern() {
-            # $1 = grep -E pattern for asset names (no associated .nix).
-            local names count
-            names=$(gh release view "$ROLL_TAG" --json assets \
-              --jq -r '.assets | sort_by(.createdAt) | reverse | .[].name' \
-              | grep -E "$1" || true)
-            count=$(echo "$names" | grep -c . || true)
-            count=${count:-0}
-            if [ "$count" -gt "$KEEP_VERSIONS" ]; then
-              echo "$names" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
-                [ -n "$t" ] || continue
-                echo "pruning old version: $t"
-                gh release delete-asset "$ROLL_TAG" "$t" -y
-              done
-            else
-              echo "keeping all $count file(s) for $1"
-            fi
-          }
-          # Linux tarballs + their versioned .nix first (name mapping differs).
-          tars=$(gh release view "$ROLL_TAG" --json assets \
-            --jq -r '.assets | sort_by(.createdAt) | reverse | .[].name' \
-            | grep -E '^readest-.*-linux-x86_64\.tar\.gz$' || true)
-          count=$(echo "$tars" | grep -c . || true)
+          tags=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq -r 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E '^fork-' | grep -v -x "$ROLL_TAG" || true)
+          count=$(echo "$tags" | grep -c . || true)
           count=${count:-0}
           if [ "$count" -gt "$KEEP_VERSIONS" ]; then
-            echo "$tars" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+            echo "$tags" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
               [ -n "$t" ] || continue
-              ver=$(echo "$t" | sed -E 's/^readest-(.*)-linux-x86_64\.tar\.gz$/\1/')
-              echo "pruning old version: $t"
-              gh release delete-asset "$ROLL_TAG" "$t" -y
-              gh release delete-asset "$ROLL_TAG" "readest-${ver}.nix" -y || true
+              echo "pruning old versioned release: $t"
+              gh release delete "$t" --cleanup-tag -y
             done
           else
-            echo "keeping all $count linux tarball(s)"
+            echo "keeping all $count versioned release(s)"
           fi
-          prune_pattern '^Readest_.*_arm64\.apk$'
-          prune_pattern '^Readest_.*_x64-setup\.exe$'
