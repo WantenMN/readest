@@ -16,8 +16,9 @@
 # pointer on the rolling tag, and verifies with a real `nix build`.
 # dotfiles consumes the pointer via pkgs/update-fork-tarballs.sh.
 #
-# Versioned tag releases stay in fork-release.yml (same three artifacts per
-# tag, naturally retained one-release-per-tag).
+# This is the ONLY release flow: every push to release/fork produces one
+# versioned release. (The old tag-triggered fork-release.yml was retired;
+# existing `v*` releases stay untouched.)
 name: Fork Tarball (rolling)
 
 on:
