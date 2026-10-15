@@ -1,0 +1,172 @@
+# Fork rolling tarball (Linux only, traditional packaging, no Nix).
+#
+# Push to release/fork -> Tauri deb build on ubuntu-22.04 (same webkit2gtk-4.1
+# baseline as fork-release.yml), extract the deb payload and repack it as a
+# plain readest-linux-x86_64.tar.gz (top level share/, contents of stage/usr),
+# force-move rolling tag `fork-linux-x86_64`, upload, fill version/hash into
+# dist/nix/readest.nix, upload that too, then verify with a real `nix build`
+# of the uploaded URL.
+#
+# dotfiles consumes this via pkgs/update-fork-tarballs.sh which just downloads
+# the generated readest.nix. Versioned tag releases stay in fork-release.yml
+# (android/windows/deb-source unchanged, linux leg also switched to tar.gz).
+name: Fork Tarball (Linux)
+
+on:
+  push:
+    branches:
+      - release/fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  TARBALL: readest-linux-x86_64.tar.gz
+  NIX_ASSET: readest.nix
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+
+jobs:
+  tarball:
+    name: Build, publish and verify linux tarball
+    if: github.repository == 'WantenMN/readest'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
+        with:
+          key: fork-tarball-linux-cargo
+
+      - name: cache Next.js build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/readest-app/.next/cache
+          key: nextjs-${{ runner.os }}-${{ hashFiles('apps/readest-app/src/**/*.{ts,tsx,css,json}', 'apps/readest-app/next.config.mjs') }}
+          restore-keys: |
+            nextjs-${{ runner.os }}-
+
+      - name: install dependencies (ubuntu only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: create .env.local file for Next.js
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" > apps/readest-app/.env.local
+
+      - name: compute rolling version
+        shell: bash
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          # No zero-padding: SemVer forbids leading zeros (2026.08.15 invalid).
+          ver_date=$(date -u +%Y.%-m.%-d)
+          echo "fork_version=${ver_date}-g${short_sha}" >> "$GITHUB_ENV"
+
+      - name: stamp package version
+        shell: bash
+        run: |
+          node -e "const f='apps/readest-app/package.json';const j=require('./'+f);j.version='${fork_version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+      - name: build Linux x86_64 tarball payload
+        shell: bash
+        timeout-minutes: 45
+        env:
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          cd apps/readest-app
+          pnpm tauri build --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          cd ../..
+          # Tauri has no native plain-tarball output; the .deb payload
+          # (binary, resources, icons, .desktop) is extracted and repacked
+          # as a plain tar.gz (contents of stage/usr, top level share/).
+          rm -rf tarball/stage
+          mkdir -p tarball/stage
+          dpkg-deb -x "target/release/bundle/deb/Readest_${fork_version}_amd64.deb" tarball/stage
+          tar -czf "tarball/${TARBALL}" -C tarball/stage/usr .
+          ls -lh "tarball/${TARBALL}"
+
+      - name: smoke test staged payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/readest-smoke
+          mkdir -p /tmp/readest-smoke
+          tar -xzf "tarball/${TARBALL}" -C /tmp/readest-smoke
+          test -x /tmp/readest-smoke/share/Readest/readest
+          test -f /tmp/readest-smoke/share/applications/Readest.desktop
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: publish to rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Readest fork rolling (linux x86_64)" \
+              --notes "Rolling prebuilt linux tarball from release/fork. Nix consumers fetch ${NIX_ASSET}." \
+              --target release/fork
+          fi
+          gh release upload "$ROLL_TAG" "tarball/${TARBALL}" --clobber
+
+      - name: generate + publish verified .nix and verify nix build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/WantenMN/readest/releases/download/${ROLL_TAG}/${TARBALL}"
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${fork_version}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          test -x "$out/bin/readest"
